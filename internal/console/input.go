@@ -28,7 +28,7 @@ func GetFile() (*os.File, error) {
 		return nil, err
 	}
 
-	file, err := os.OpenFile(response, os.O_RDWR|os.O_CREATE, os.ModeAppend)
+	file, err := os.OpenFile(response, os.O_RDWR|os.O_CREATE, 0666)
 
 	if err != nil {
 		return nil, err

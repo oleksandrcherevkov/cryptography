@@ -1,8 +1,14 @@
 package crypto
 
-import "io"
+type Encrypter interface {
+	Encrypt(*Stream) error
+}
+
+type Decrypter interface {
+	Decrypt(*Stream) error
+}
 
 type Algorithm interface {
-	Encrypt(io.Reader, io.Writer) error
-	Decrypt(io.Reader, io.Writer) error
+	Encrypter
+	Decrypter
 }

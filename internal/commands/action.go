@@ -22,12 +22,30 @@ func (s *ActionCommand) Exec() (Command, error) {
 	if err != nil {
 		return nil, err
 	}
+	stream := crypto.NewStream(s.input, s.output)
 	switch response {
 	case "1":
-		err = s.algorithm.Encrypt(s.input, s.output)
+		err = s.algorithm.Encrypt(stream)
 	case "2":
-		err = s.algorithm.Decrypt(s.input, s.output)
+		err = s.algorithm.Decrypt(stream)
 	}
+	if err != nil {
+		return nil, err
+	}
+	s.input.Close()
+	s.output.Close()
+	return ExitCommand{}, nil
+}
+
+type DecryptCommand struct {
+	decrypter crypto.Decrypter
+	input     io.ReadCloser
+	output    io.WriteCloser
+}
+
+func (s *DecryptCommand) Exec() (Command, error) {
+	stream := crypto.NewStream(s.input, s.output)
+	err := s.decrypter.Decrypt(stream)
 	if err != nil {
 		return nil, err
 	}
