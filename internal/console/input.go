@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -34,4 +35,13 @@ func GetFile() (*os.File, error) {
 		return nil, err
 	}
 	return file, nil
+}
+
+func GetUint() (uint, error) {
+	str, err := GetString()
+	if err != nil {
+		return 0, err
+	}
+	number, err := strconv.ParseUint(str, 10, 0)
+	return uint(number), err
 }

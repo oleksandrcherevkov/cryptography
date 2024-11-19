@@ -22,7 +22,7 @@ func (s *ActionCommand) Exec() (Command, error) {
 	if err != nil {
 		return nil, err
 	}
-	stream := crypto.NewStream(s.input, s.output)
+	stream := crypto.NewStream(s.input, s.output, false)
 	switch response {
 	case "1":
 		err = s.algorithm.Encrypt(stream)
@@ -44,7 +44,7 @@ type DecryptCommand struct {
 }
 
 func (s *DecryptCommand) Exec() (Command, error) {
-	stream := crypto.NewStream(s.input, s.output)
+	stream := crypto.NewStream(s.input, s.output, true)
 	err := s.decrypter.Decrypt(stream)
 	if err != nil {
 		return nil, err

@@ -10,12 +10,16 @@ type Stream struct {
 	reader       io.Reader
 	readerBuffer bytes.Buffer
 	writer       io.Writer
+	buffered     bool
 }
 
-func NewStream(reader io.Reader, writer io.Writer) *Stream {
+func NewStream(reader io.Reader, writer io.Writer, buffered bool) *Stream {
 	stream := &Stream{}
-	stream.reader = io.TeeReader(reader, &stream.readerBuffer)
+	stream.reader = reader
 	stream.writer = writer
+	if buffered {
+		stream.reader = io.TeeReader(reader, &stream.readerBuffer)
+	}
 	return stream
 }
 
@@ -52,7 +56,9 @@ func (s *Stream) Pass(transform func(byte) byte) error {
 			return errors.New("no write to output")
 		}
 	}
-	s.refreshReader()
+	if s.buffered {
+		s.refreshReader()
+	}
 	char[0] = '\n'
 	n, err := s.Write(char)
 	if err != nil {
@@ -63,6 +69,33 @@ func (s *Stream) Pass(transform func(byte) byte) error {
 	}
 	return nil
 
+}
+
+func (s *Stream) Transform(transform func([]byte), buffer []byte) error {
+	for {
+		n, err := s.Read(buffer)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return errors.New("no read from input")
+		}
+		transform(buffer)
+		n, err = s.Write(buffer)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return errors.New("no write to output")
+		}
+	}
+	if s.buffered {
+		s.refreshReader()
+	}
+	return nil
 }
 
 func (s *Stream) Scan(f func(byte) error) error {
@@ -86,7 +119,9 @@ func (s *Stream) Scan(f func(byte) error) error {
 			return err
 		}
 	}
-	s.refreshReader()
+	if s.buffered {
+		s.refreshReader()
+	}
 	return nil
 }
 
