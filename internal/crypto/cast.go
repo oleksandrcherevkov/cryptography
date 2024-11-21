@@ -4,9 +4,20 @@ import (
 	"math/bits"
 )
 
+const rotationMask = 0b11111
+
 type Cast struct {
-	key castKey
+	key key
 }
+
+type key [16]byte
+
+type subkey struct {
+	mask     uint32
+	rotation byte // only 5 bits
+}
+
+type roundFunction func(half uint32, subkey subkey) uint32
 
 func NewCast(key [16]byte) Cast {
 	return Cast{
@@ -14,32 +25,25 @@ func NewCast(key [16]byte) Cast {
 	}
 }
 
-type castKey [16]byte
-
-type subkey struct {
-	Mask     uint32
-	Rotation byte // only 5 bits
-}
-
 func (c Cast) Encrypt(s *Stream) error {
-	subkeys := getSubkeys(c.key)
+	subkeys := c.key.sub()
 	buffer := make([]byte, 8)
 	transform := func(data []byte) {
-		block := getUint64(data)
+		block := composeUint64(data)
 		block = cast(subkeys, block)
-		getData(data, block)
+		splitUint64(data, block)
 	}
 	s.Transform(transform, buffer)
 	return nil
 }
 
 func (c Cast) Decrypt(s *Stream) error {
-	subkeys := getSubkeys(c.key)
+	subkeys := c.key.sub()
 	buffer := make([]byte, 8)
 	transform := func(data []byte) {
-		block := getUint64(data)
+		block := composeUint64(data)
 		block = decast(subkeys, block)
-		getData(data, block)
+		splitUint64(data, block)
 	}
 	s.Transform(transform, buffer)
 	return nil
@@ -51,7 +55,8 @@ func cast(subkeys [16]subkey, data uint64) uint64 {
 	for i := 0; i < 16; i++ {
 		leftDataTemp := leftData
 		leftData = rightData
-		rightData = leftDataTemp ^ f(i, rightData, subkeys[i])
+		iterationFunction := determineType(i)
+		rightData = leftDataTemp ^ iterationFunction(rightData, subkeys[i])
 	}
 	data = uint64(rightData) << 32
 	data = data | uint64(leftData)
@@ -64,123 +69,127 @@ func decast(subkeys [16]subkey, data uint64) uint64 {
 	for i := 15; i >= 0; i-- {
 		leftDataTemp := leftData
 		leftData = rightData
-		rightData = leftDataTemp ^ f(i, rightData, subkeys[i])
+		roundFunction := determineType(i)
+		rightData = leftDataTemp ^ roundFunction(rightData, subkeys[i])
 	}
 	data = uint64(rightData) << 32
 	data = data | uint64(leftData)
 	return data
 }
 
-func f(iteration int, data uint32, subkey subkey) uint32 {
-	switch iteration % 3 {
+func determineType(round int) roundFunction {
+	switch round % 3 {
 	case 0:
-		return typeOne(data, subkey)
+		return typeOne
 	case 1:
-		return typeTwo(data, subkey)
+		return typeTwo
 	case 2:
-		return typeThree(data, subkey)
+		return typeThree
 	}
-	return 0
+	panic("false round counter")
 }
 
 func typeOne(data uint32, subkey subkey) uint32 {
-	i := bits.RotateLeft32((subkey.Mask + data), int(subkey.Rotation))
-	return ((Box1[getByte(i, 0)] ^ Box2[getByte(i, 1)]) - Box3[getByte(i, 2)]) + Box4[getByte(i, 3)]
+	i := bits.RotateLeft32((subkey.mask + data), int(subkey.rotation))
+	return ((Box1[extractByte(i, 0)] ^ Box2[extractByte(i, 1)]) - Box3[extractByte(i, 2)]) + Box4[extractByte(i, 3)]
 }
 
 func typeTwo(data uint32, subkey subkey) uint32 {
-	i := bits.RotateLeft32((subkey.Mask ^ data), int(subkey.Rotation))
-	return ((Box1[getByte(i, 0)] - Box2[getByte(i, 1)]) + Box3[getByte(i, 2)]) ^ Box4[getByte(i, 3)]
+	i := bits.RotateLeft32((subkey.mask ^ data), int(subkey.rotation))
+	return ((Box1[extractByte(i, 0)] - Box2[extractByte(i, 1)]) + Box3[extractByte(i, 2)]) ^ Box4[extractByte(i, 3)]
 }
 
 func typeThree(data uint32, subkey subkey) uint32 {
-	i := bits.RotateLeft32((subkey.Mask - data), int(subkey.Rotation))
-	return ((Box1[getByte(i, 0)] + Box2[getByte(i, 1)]) ^ Box3[getByte(i, 2)]) - Box4[getByte(i, 3)]
+	i := bits.RotateLeft32((subkey.mask - data), int(subkey.rotation))
+	return ((Box1[extractByte(i, 0)] + Box2[extractByte(i, 1)]) ^ Box3[extractByte(i, 2)]) - Box4[extractByte(i, 3)]
 }
 
-func getSubkeys(key castKey) [16]subkey {
+func (k key) sub() [16]subkey {
 	var maskKeys [32]uint32
-	maskKeysHalf, processedKey := boxKey(key)
+	maskKeysHalf, processedKey := k.unbox()
 	for i := 0; i < 16; i++ {
 		maskKeys[i] = maskKeysHalf[i]
 	}
-	maskKeysHalf, _ = boxKey(processedKey)
+	maskKeysHalf, _ = processedKey.unbox()
 	for i := 16; i < 32; i++ {
 		maskKeys[i] = maskKeysHalf[i-16]
 	}
 
-	var subkeys [16]subkey
+	var subs [16]subkey
 	for i := 0; i < 16; i++ {
-		subkeys[i].Mask = maskKeys[i]
-		subkeys[i].Rotation = getRotationBits(maskKeys[i+16])
+		subs[i].mask = maskKeys[i]
+		subs[i].rotation = rotation(maskKeys[i+16])
 	}
-	return subkeys
+	return subs
 }
 
-func boxKey(key castKey) ([16]uint32, castKey) {
-	var res castKey
+func (k key) unbox() ([16]uint32, key) {
+	var r key
 	var box [16]uint32
-	res = key.foo(0x0, res, 0x0, Box5[key[0xd]], Box6[key[0xf]], Box7[key[0xc]], Box8[key[0xe]], Box7[key[0x8]])
-	res = key.foo(0x8, res, 0x4, Box5[res[0x0]], Box6[res[0x2]], Box7[res[0x1]], Box8[res[0x3]], Box8[key[0xa]])
-	res = key.foo(0xc, res, 0x8, Box5[res[0x7]], Box6[res[0x6]], Box7[res[0x5]], Box8[res[0x4]], Box5[key[0x9]])
-	res = key.foo(0x4, res, 0xc, Box5[res[0xa]], Box6[res[0x9]], Box7[res[0xb]], Box8[res[0x8]], Box6[key[0xb]])
-	box[0] = Box5[res[0x8]] ^ Box6[res[0x9]] ^ Box7[res[0x7]] ^ Box8[res[0x6]] ^ Box5[res[0x2]]
-	box[1] = Box5[res[0xa]] ^ Box6[res[0xb]] ^ Box7[res[0x5]] ^ Box8[res[0x4]] ^ Box6[res[0x6]]
-	box[2] = Box5[res[0xc]] ^ Box6[res[0xd]] ^ Box7[res[0x3]] ^ Box8[res[0x2]] ^ Box7[res[0x9]]
-	box[3] = Box5[res[0xe]] ^ Box6[res[0xf]] ^ Box7[res[0x1]] ^ Box8[res[0x0]] ^ Box8[res[0xc]]
+	r = k.foo(0x0, r, 0x0, Box5[k[0xd]], Box6[k[0xf]], Box7[k[0xc]], Box8[k[0xe]], Box7[k[0x8]])
+	r = k.foo(0x8, r, 0x4, Box5[r[0x0]], Box6[r[0x2]], Box7[r[0x1]], Box8[r[0x3]], Box8[k[0xa]])
+	r = k.foo(0xc, r, 0x8, Box5[r[0x7]], Box6[r[0x6]], Box7[r[0x5]], Box8[r[0x4]], Box5[k[0x9]])
+	r = k.foo(0x4, r, 0xc, Box5[r[0xa]], Box6[r[0x9]], Box7[r[0xb]], Box8[r[0x8]], Box6[k[0xb]])
+	box[0] = Box5[r[0x8]] ^ Box6[r[0x9]] ^ Box7[r[0x7]] ^ Box8[r[0x6]] ^ Box5[r[0x2]]
+	box[1] = Box5[r[0xa]] ^ Box6[r[0xb]] ^ Box7[r[0x5]] ^ Box8[r[0x4]] ^ Box6[r[0x6]]
+	box[2] = Box5[r[0xc]] ^ Box6[r[0xd]] ^ Box7[r[0x3]] ^ Box8[r[0x2]] ^ Box7[r[0x9]]
+	box[3] = Box5[r[0xe]] ^ Box6[r[0xf]] ^ Box7[r[0x1]] ^ Box8[r[0x0]] ^ Box8[r[0xc]]
 
-	key = res.foo(0x8, key, 0x0, Box5[res[0x5]], Box6[res[0x7]], Box7[res[0x4]], Box8[res[0x6]], Box7[res[0x0]])
-	key = res.foo(0x0, key, 0x4, Box5[key[0x0]], Box6[key[0x2]], Box7[key[0x1]], Box8[key[0x3]], Box8[res[0x2]])
-	key = res.foo(0x4, key, 0x8, Box5[key[0x7]], Box6[key[0x6]], Box7[key[0x5]], Box8[key[0x4]], Box5[res[0x1]])
-	key = res.foo(0xc, key, 0xc, Box5[key[0xa]], Box6[key[0x9]], Box7[key[0xb]], Box8[key[0x8]], Box6[res[0x3]])
-	box[4] = Box5[key[0x3]] ^ Box6[key[0x2]] ^ Box7[key[0xc]] ^ Box8[key[0xd]] ^ Box5[key[0x8]]
-	box[5] = Box5[key[0x1]] ^ Box6[key[0x0]] ^ Box7[key[0xe]] ^ Box8[key[0xf]] ^ Box6[key[0xd]]
-	box[6] = Box5[key[0x7]] ^ Box6[key[0x6]] ^ Box7[key[0x8]] ^ Box8[key[0x9]] ^ Box7[key[0x3]]
-	box[7] = Box5[key[0x5]] ^ Box6[key[0x4]] ^ Box7[key[0xa]] ^ Box8[key[0xb]] ^ Box8[key[0x7]]
+	k = r.foo(0x8, k, 0x0, Box5[r[0x5]], Box6[r[0x7]], Box7[r[0x4]], Box8[r[0x6]], Box7[r[0x0]])
+	k = r.foo(0x0, k, 0x4, Box5[k[0x0]], Box6[k[0x2]], Box7[k[0x1]], Box8[k[0x3]], Box8[r[0x2]])
+	k = r.foo(0x4, k, 0x8, Box5[k[0x7]], Box6[k[0x6]], Box7[k[0x5]], Box8[k[0x4]], Box5[r[0x1]])
+	k = r.foo(0xc, k, 0xc, Box5[k[0xa]], Box6[k[0x9]], Box7[k[0xb]], Box8[k[0x8]], Box6[r[0x3]])
+	box[4] = Box5[k[0x3]] ^ Box6[k[0x2]] ^ Box7[k[0xc]] ^ Box8[k[0xd]] ^ Box5[k[0x8]]
+	box[5] = Box5[k[0x1]] ^ Box6[k[0x0]] ^ Box7[k[0xe]] ^ Box8[k[0xf]] ^ Box6[k[0xd]]
+	box[6] = Box5[k[0x7]] ^ Box6[k[0x6]] ^ Box7[k[0x8]] ^ Box8[k[0x9]] ^ Box7[k[0x3]]
+	box[7] = Box5[k[0x5]] ^ Box6[k[0x4]] ^ Box7[k[0xa]] ^ Box8[k[0xb]] ^ Box8[k[0x7]]
 
-	res = key.foo(0x0, res, 0x0, Box5[key[0xd]], Box6[key[0xf]], Box7[key[0xc]], Box8[key[0xe]], Box7[key[0x8]])
-	res = key.foo(0x8, res, 0x4, Box5[res[0x0]], Box6[res[0x2]], Box7[res[0x1]], Box8[res[0x3]], Box8[key[0xa]])
-	res = key.foo(0xc, res, 0x8, Box5[res[0x7]], Box6[res[0x6]], Box7[res[0x5]], Box8[res[0x4]], Box5[key[0x9]])
-	res = key.foo(0x4, res, 0xc, Box5[res[0xa]], Box6[res[0x9]], Box7[res[0xb]], Box8[res[0x8]], Box6[key[0xb]])
-	box[0x8] = Box5[res[0x3]] ^ Box6[res[0x2]] ^ Box7[res[0xc]] ^ Box8[res[0xd]] ^ Box5[res[0x9]]
-	box[0x9] = Box5[res[0x1]] ^ Box6[res[0x0]] ^ Box7[res[0xe]] ^ Box8[res[0xf]] ^ Box6[res[0xC]]
-	box[0xa] = Box5[res[0x7]] ^ Box6[res[0x6]] ^ Box7[res[0x8]] ^ Box8[res[0x9]] ^ Box7[res[0x2]]
-	box[0xb] = Box5[res[0x5]] ^ Box6[res[0x4]] ^ Box7[res[0xa]] ^ Box8[res[0xb]] ^ Box8[res[0x6]]
+	r = k.foo(0x0, r, 0x0, Box5[k[0xd]], Box6[k[0xf]], Box7[k[0xc]], Box8[k[0xe]], Box7[k[0x8]])
+	r = k.foo(0x8, r, 0x4, Box5[r[0x0]], Box6[r[0x2]], Box7[r[0x1]], Box8[r[0x3]], Box8[k[0xa]])
+	r = k.foo(0xc, r, 0x8, Box5[r[0x7]], Box6[r[0x6]], Box7[r[0x5]], Box8[r[0x4]], Box5[k[0x9]])
+	r = k.foo(0x4, r, 0xc, Box5[r[0xa]], Box6[r[0x9]], Box7[r[0xb]], Box8[r[0x8]], Box6[k[0xb]])
+	box[0x8] = Box5[r[0x3]] ^ Box6[r[0x2]] ^ Box7[r[0xc]] ^ Box8[r[0xd]] ^ Box5[r[0x9]]
+	box[0x9] = Box5[r[0x1]] ^ Box6[r[0x0]] ^ Box7[r[0xe]] ^ Box8[r[0xf]] ^ Box6[r[0xC]]
+	box[0xa] = Box5[r[0x7]] ^ Box6[r[0x6]] ^ Box7[r[0x8]] ^ Box8[r[0x9]] ^ Box7[r[0x2]]
+	box[0xb] = Box5[r[0x5]] ^ Box6[r[0x4]] ^ Box7[r[0xa]] ^ Box8[r[0xb]] ^ Box8[r[0x6]]
 
-	key = res.foo(0x8, key, 0x0, Box5[res[0x5]], Box6[res[0x7]], Box7[res[0x4]], Box8[res[0x6]], Box7[res[0x0]])
-	key = res.foo(0x0, key, 0x4, Box5[key[0x0]], Box6[key[0x2]], Box7[key[0x1]], Box8[key[0x3]], Box8[res[0x2]])
-	key = res.foo(0x4, key, 0x8, Box5[key[0x7]], Box6[key[0x6]], Box7[key[0x5]], Box8[key[0x4]], Box5[res[0x1]])
-	key = res.foo(0xc, key, 0xc, Box5[key[0xa]], Box6[key[0x9]], Box7[key[0xb]], Box8[key[0x8]], Box6[res[0x3]])
-	box[0xc] = Box5[key[0x8]] ^ Box6[key[0x9]] ^ Box7[key[0x7]] ^ Box8[key[0x6]] ^ Box5[key[0x3]]
-	box[0xd] = Box5[key[0xa]] ^ Box6[key[0xb]] ^ Box7[key[0x5]] ^ Box8[key[0x4]] ^ Box6[key[0x7]]
-	box[0xe] = Box5[key[0xc]] ^ Box6[key[0xd]] ^ Box7[key[0x3]] ^ Box8[key[0x2]] ^ Box7[key[0x8]]
-	box[0xf] = Box5[key[0xe]] ^ Box6[key[0xf]] ^ Box7[key[0x1]] ^ Box8[key[0x0]] ^ Box8[key[0xd]]
-	return box, res
+	k = r.foo(0x8, k, 0x0, Box5[r[0x5]], Box6[r[0x7]], Box7[r[0x4]], Box8[r[0x6]], Box7[r[0x0]])
+	k = r.foo(0x0, k, 0x4, Box5[k[0x0]], Box6[k[0x2]], Box7[k[0x1]], Box8[k[0x3]], Box8[r[0x2]])
+	k = r.foo(0x4, k, 0x8, Box5[k[0x7]], Box6[k[0x6]], Box7[k[0x5]], Box8[k[0x4]], Box5[r[0x1]])
+	k = r.foo(0xc, k, 0xc, Box5[k[0xa]], Box6[k[0x9]], Box7[k[0xb]], Box8[k[0x8]], Box6[r[0x3]])
+	box[0xc] = Box5[k[0x8]] ^ Box6[k[0x9]] ^ Box7[k[0x7]] ^ Box8[k[0x6]] ^ Box5[k[0x3]]
+	box[0xd] = Box5[k[0xa]] ^ Box6[k[0xb]] ^ Box7[k[0x5]] ^ Box8[k[0x4]] ^ Box6[k[0x7]]
+	box[0xe] = Box5[k[0xc]] ^ Box6[k[0xd]] ^ Box7[k[0x3]] ^ Box8[k[0x2]] ^ Box7[k[0x8]]
+	box[0xf] = Box5[k[0xe]] ^ Box6[k[0xf]] ^ Box7[k[0x1]] ^ Box8[k[0x0]] ^ Box8[k[0xd]]
+
+	return box, r
 }
 
-func (key castKey) foo(keyFirst int, result castKey, firstResult int, a, b, c, d, e uint32) castKey {
-	block := key.getUint32(keyFirst)
-	block = block ^ a ^ b ^ c ^ d ^ e
-	for i := firstResult; i < firstResult+4; i++ {
-		result[i] = getByte(block, i-firstResult)
+func (k key) foo(keyFirst int, result key, resultFirst int, masks ...uint32) key {
+	block := k.extractUint32(keyFirst)
+	for _, mask := range masks {
+		block = block ^ mask
+	}
+	for i := 0; i < 4; i++ {
+		result[i+resultFirst] = extractByte(block, i)
 	}
 	return result
 }
 
-func getByte(number uint32, position int) byte {
+func (k key) extractUint32(position int) uint32 {
+	var result uint32
+	for i := 0; i < 3; i++ {
+		result = result | (uint32(k[position+i]) << (3 - i))
+	}
+	return result
+}
+
+func extractByte(number uint32, position int) byte {
 	number = number >> (3 - position)
 	return byte(number)
 }
 
-func (key castKey) getUint32(position int) uint32 {
-	var result uint32
-	for i := 0; i < 3; i++ {
-		result = result | (uint32(key[position+i]) << (3 - i))
-	}
-	return result
-}
-
-func getUint64(bytes []byte) uint64 {
+func composeUint64(bytes []byte) uint64 {
 	var result uint64
 	for i := 0; i < 8; i++ {
 		result = result | (uint64(bytes[i]) << ((7 - i) * 8))
@@ -188,17 +197,14 @@ func getUint64(bytes []byte) uint64 {
 	return result
 }
 
-func getData(data []byte, number uint64) {
+func splitUint64(data []byte, number uint64) {
 	for i := 0; i < 8; i++ {
 		data[i] = byte(number >> ((7 - i) * 8))
 	}
 }
 
-func getRotationBits(number uint32) byte {
-	rotation := getByte(number, 3)
-	var fiveBitMask byte = 0b11111
-	rotation = rotation & fiveBitMask
-	return rotation
+func rotation(number uint32) byte {
+	return byte(number) & rotationMask
 }
 
 var Box1 = [256]uint32{
