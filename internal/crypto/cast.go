@@ -21,7 +21,7 @@ type subkey struct {
 	Rotation byte // only 5 bits
 }
 
-func (c Cast) Encrypt(s Stream) error {
+func (c Cast) Encrypt(s *Stream) error {
 	subkeys := getSubkeys(c.key)
 	buffer := make([]byte, 8)
 	transform := func(data []byte) {
@@ -33,8 +33,16 @@ func (c Cast) Encrypt(s Stream) error {
 	return nil
 }
 
-func (c Cast) Decrypt(s Stream) error {
-	return c.Encrypt(s)
+func (c Cast) Decrypt(s *Stream) error {
+	subkeys := getSubkeys(c.key)
+	buffer := make([]byte, 8)
+	transform := func(data []byte) {
+		block := getUint64(data)
+		block = decast(subkeys, block)
+		getData(data, block)
+	}
+	s.Transform(transform, buffer)
+	return nil
 }
 
 func cast(subkeys [16]subkey, data uint64) uint64 {
@@ -46,7 +54,20 @@ func cast(subkeys [16]subkey, data uint64) uint64 {
 		rightData = leftDataTemp ^ f(i, rightData, subkeys[i])
 	}
 	data = uint64(rightData) << 32
-	data = data & uint64(leftData)
+	data = data | uint64(leftData)
+	return data
+}
+
+func decast(subkeys [16]subkey, data uint64) uint64 {
+	rightData := uint32(data)
+	leftData := uint32(data >> 32)
+	for i := 15; i >= 0; i-- {
+		leftDataTemp := leftData
+		leftData = rightData
+		rightData = leftDataTemp ^ f(i, rightData, subkeys[i])
+	}
+	data = uint64(rightData) << 32
+	data = data | uint64(leftData)
 	return data
 }
 
@@ -78,13 +99,13 @@ func typeThree(data uint32, subkey subkey) uint32 {
 }
 
 func getSubkeys(key castKey) [16]subkey {
-	var maskKeys [36]uint32
+	var maskKeys [32]uint32
 	maskKeysHalf, processedKey := boxKey(key)
 	for i := 0; i < 16; i++ {
 		maskKeys[i] = maskKeysHalf[i]
 	}
 	maskKeysHalf, _ = boxKey(processedKey)
-	for i := 16; i < 36; i++ {
+	for i := 16; i < 32; i++ {
 		maskKeys[i] = maskKeysHalf[i-16]
 	}
 
@@ -153,8 +174,8 @@ func getByte(number uint32, position int) byte {
 
 func (key castKey) getUint32(position int) uint32 {
 	var result uint32
-	for i := position; i < position+3; i++ {
-		result = result | (uint32(key[position]) << (3 - i - position))
+	for i := 0; i < 3; i++ {
+		result = result | (uint32(key[position+i]) << (3 - i))
 	}
 	return result
 }
@@ -169,7 +190,7 @@ func getUint64(bytes []byte) uint64 {
 
 func getData(data []byte, number uint64) {
 	for i := 0; i < 8; i++ {
-		data[i] = byte(number >> ((7 - 1) * 8))
+		data[i] = byte(number >> ((7 - i) * 8))
 	}
 }
 
