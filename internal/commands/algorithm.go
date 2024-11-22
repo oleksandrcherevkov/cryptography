@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -68,7 +67,10 @@ func (s *AlgorithmCommand) Exec() (Command, error) {
 		if err != nil {
 			return nil, err
 		}
-		cast := crypto.NewCast(key)
+		cast, err := crypto.NewCast(key)
+		if err != nil {
+			return nil, err
+		}
 		return &ActionCommand{
 			algorithm: cast,
 			input:     s.input,
@@ -78,16 +80,13 @@ func (s *AlgorithmCommand) Exec() (Command, error) {
 	return ExitCommand{}, nil
 }
 
-func getCastKey() ([16]byte, error) {
-	var key [16]byte
+func getCastKey() ([]byte, error) {
+	key := make([]byte, 0)
 	keyString, err := console.GetString()
 	if err != nil {
 		return key, err
 	}
-	if len(keyString) != 32 {
-		return key, errors.New("key not right size of 32 hex values")
-	}
-	for i := 0; i < 32; i += 2 {
+	for i := 0; i < len(keyString); i += 2 {
 		byteString := keyString[i : i+2]
 		number, err := strconv.ParseUint(byteString, 16, 8)
 		if err != nil {
