@@ -92,7 +92,7 @@ func getCastKey() ([]byte, error) {
 		if err != nil {
 			return key, err
 		}
-		key[i/2] = byte(number)
+		key = append(key, byte(number))
 	}
 	return key, nil
 }
