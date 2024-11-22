@@ -1,13 +1,15 @@
 package crypto
 
 import (
+	"errors"
 	"math/bits"
 )
 
 const rotationMask = 0b11111
 
 type Cast struct {
-	key key
+	sub    [16]subkey
+	rounds int
 }
 
 type key [16]byte
@@ -19,18 +21,30 @@ type subkey struct {
 
 type roundFunction func(half uint32, subkey subkey) uint32
 
-func NewCast(key [16]byte) Cast {
-	return Cast{
-		key: key,
+func NewCast(k []byte) (Cast, error) {
+	if len(k) < 5 || len(k) > 16 {
+		return Cast{}, errors.New("key not right size from 40 to 128 bits")
 	}
+	var kk key
+	for i := 0; i < 16 && i < len(k); i++ {
+		kk[i] = k[i]
+	}
+	subkeys := kk.schedule()
+	rounds := 16
+	if len(k) <= 10 {
+		rounds = 12
+	}
+	return Cast{
+		sub:    subkeys,
+		rounds: rounds,
+	}, nil
 }
 
 func (c Cast) Encrypt(s *Stream) error {
-	subkeys := c.key.sub()
 	buffer := make([]byte, 8)
 	transform := func(data []byte) {
 		block := composeUint64(data)
-		block = cast(subkeys, block)
+		block = c.cast(block)
 		splitUint64(data, block)
 	}
 	s.Transform(transform, buffer)
@@ -38,87 +52,86 @@ func (c Cast) Encrypt(s *Stream) error {
 }
 
 func (c Cast) Decrypt(s *Stream) error {
-	subkeys := c.key.sub()
 	buffer := make([]byte, 8)
 	transform := func(data []byte) {
 		block := composeUint64(data)
-		block = decast(subkeys, block)
+		block = c.recast(block)
 		splitUint64(data, block)
 	}
 	s.Transform(transform, buffer)
 	return nil
 }
 
-func cast(subkeys [16]subkey, data uint64) uint64 {
-	rightData := uint32(data)
-	leftData := uint32(data >> 32)
-	for i := 0; i < 16; i++ {
-		leftDataTemp := leftData
-		leftData = rightData
-		iterationFunction := determineType(i)
-		rightData = leftDataTemp ^ iterationFunction(rightData, subkeys[i])
+func (c Cast) cast(data uint64) uint64 {
+	right := uint32(data)
+	left := uint32(data >> 32)
+	for i := 0; i < c.rounds; i++ {
+		leftTemp := left
+		left = right
+		f := determineF(i)
+		right = leftTemp ^ f(right, c.sub[i])
 	}
-	data = uint64(rightData) << 32
-	data = data | uint64(leftData)
+	data = uint64(right) << 32
+	data = data | uint64(left)
 	return data
 }
 
-func decast(subkeys [16]subkey, data uint64) uint64 {
-	rightData := uint32(data)
-	leftData := uint32(data >> 32)
-	for i := 15; i >= 0; i-- {
-		leftDataTemp := leftData
-		leftData = rightData
-		roundFunction := determineType(i)
-		rightData = leftDataTemp ^ roundFunction(rightData, subkeys[i])
+func (c Cast) recast(data uint64) uint64 {
+	right := uint32(data)
+	left := uint32(data >> 32)
+	for i := c.rounds - 1; i >= 0; i-- {
+		leftDataTemp := left
+		left = right
+		f := determineF(i)
+		right = leftDataTemp ^ f(right, c.sub[i])
 	}
-	data = uint64(rightData) << 32
-	data = data | uint64(leftData)
+	data = uint64(right) << 32
+	data = data | uint64(left)
 	return data
 }
 
-func determineType(round int) roundFunction {
+func determineF(round int) roundFunction {
 	switch round % 3 {
 	case 0:
-		return typeOne
+		return f1
 	case 1:
-		return typeTwo
+		return f2
 	case 2:
-		return typeThree
+		return f3
 	}
 	panic("false round counter")
 }
 
-func typeOne(data uint32, subkey subkey) uint32 {
-	i := bits.RotateLeft32((subkey.mask + data), int(subkey.rotation))
-	return ((Box1[extractByte(i, 0)] ^ Box2[extractByte(i, 1)]) - Box3[extractByte(i, 2)]) + Box4[extractByte(i, 3)]
+func f1(data uint32, subkey subkey) uint32 {
+	i := bits.RotateLeft32(subkey.mask+data, int(subkey.rotation))
+	return ((S1[extractByte(i, 0)] ^ S2[extractByte(i, 1)]) - S3[extractByte(i, 2)]) + S4[extractByte(i, 3)]
 }
 
-func typeTwo(data uint32, subkey subkey) uint32 {
-	i := bits.RotateLeft32((subkey.mask ^ data), int(subkey.rotation))
-	return ((Box1[extractByte(i, 0)] - Box2[extractByte(i, 1)]) + Box3[extractByte(i, 2)]) ^ Box4[extractByte(i, 3)]
+func f2(data uint32, subkey subkey) uint32 {
+	i := bits.RotateLeft32(subkey.mask^data, int(subkey.rotation))
+	return ((S1[extractByte(i, 0)] - S2[extractByte(i, 1)]) + S3[extractByte(i, 2)]) ^ S4[extractByte(i, 3)]
 }
 
-func typeThree(data uint32, subkey subkey) uint32 {
-	i := bits.RotateLeft32((subkey.mask - data), int(subkey.rotation))
-	return ((Box1[extractByte(i, 0)] + Box2[extractByte(i, 1)]) ^ Box3[extractByte(i, 2)]) - Box4[extractByte(i, 3)]
+func f3(data uint32, subkey subkey) uint32 {
+	i := bits.RotateLeft32(subkey.mask-data, int(subkey.rotation))
+	return ((S1[extractByte(i, 0)] + S2[extractByte(i, 1)]) ^ S3[extractByte(i, 2)]) - S4[extractByte(i, 3)]
 }
 
-func (k key) sub() [16]subkey {
-	var maskKeys [32]uint32
-	maskKeysHalf, processedKey := k.unbox()
+func (k key) schedule() [16]subkey {
+	var masks [32]uint32
+	masksHalf, processedKey := k.unbox()
 	for i := 0; i < 16; i++ {
-		maskKeys[i] = maskKeysHalf[i]
+		masks[i] = masksHalf[i]
 	}
-	maskKeysHalf, _ = processedKey.unbox()
+	masksHalf, _ = processedKey.unbox()
 	for i := 16; i < 32; i++ {
-		maskKeys[i] = maskKeysHalf[i-16]
+		masks[i] = masksHalf[i-16]
 	}
 
 	var subs [16]subkey
 	for i := 0; i < 16; i++ {
-		subs[i].mask = maskKeys[i]
-		subs[i].rotation = rotation(maskKeys[i+16])
+		subs[i].mask = masks[i]
+		subs[i].rotation = rotation(masks[i+16])
 	}
 	return subs
 }
@@ -126,46 +139,47 @@ func (k key) sub() [16]subkey {
 func (k key) unbox() ([16]uint32, key) {
 	var r key
 	var box [16]uint32
-	r = k.foo(0x0, r, 0x0, Box5[k[0xd]], Box6[k[0xf]], Box7[k[0xc]], Box8[k[0xe]], Box7[k[0x8]])
-	r = k.foo(0x8, r, 0x4, Box5[r[0x0]], Box6[r[0x2]], Box7[r[0x1]], Box8[r[0x3]], Box8[k[0xa]])
-	r = k.foo(0xc, r, 0x8, Box5[r[0x7]], Box6[r[0x6]], Box7[r[0x5]], Box8[r[0x4]], Box5[k[0x9]])
-	r = k.foo(0x4, r, 0xc, Box5[r[0xa]], Box6[r[0x9]], Box7[r[0xb]], Box8[r[0x8]], Box6[k[0xb]])
-	box[0] = Box5[r[0x8]] ^ Box6[r[0x9]] ^ Box7[r[0x7]] ^ Box8[r[0x6]] ^ Box5[r[0x2]]
-	box[1] = Box5[r[0xa]] ^ Box6[r[0xb]] ^ Box7[r[0x5]] ^ Box8[r[0x4]] ^ Box6[r[0x6]]
-	box[2] = Box5[r[0xc]] ^ Box6[r[0xd]] ^ Box7[r[0x3]] ^ Box8[r[0x2]] ^ Box7[r[0x9]]
-	box[3] = Box5[r[0xe]] ^ Box6[r[0xf]] ^ Box7[r[0x1]] ^ Box8[r[0x0]] ^ Box8[r[0xc]]
 
-	k = r.foo(0x8, k, 0x0, Box5[r[0x5]], Box6[r[0x7]], Box7[r[0x4]], Box8[r[0x6]], Box7[r[0x0]])
-	k = r.foo(0x0, k, 0x4, Box5[k[0x0]], Box6[k[0x2]], Box7[k[0x1]], Box8[k[0x3]], Box8[r[0x2]])
-	k = r.foo(0x4, k, 0x8, Box5[k[0x7]], Box6[k[0x6]], Box7[k[0x5]], Box8[k[0x4]], Box5[r[0x1]])
-	k = r.foo(0xc, k, 0xc, Box5[k[0xa]], Box6[k[0x9]], Box7[k[0xb]], Box8[k[0x8]], Box6[r[0x3]])
-	box[4] = Box5[k[0x3]] ^ Box6[k[0x2]] ^ Box7[k[0xc]] ^ Box8[k[0xd]] ^ Box5[k[0x8]]
-	box[5] = Box5[k[0x1]] ^ Box6[k[0x0]] ^ Box7[k[0xe]] ^ Box8[k[0xf]] ^ Box6[k[0xd]]
-	box[6] = Box5[k[0x7]] ^ Box6[k[0x6]] ^ Box7[k[0x8]] ^ Box8[k[0x9]] ^ Box7[k[0x3]]
-	box[7] = Box5[k[0x5]] ^ Box6[k[0x4]] ^ Box7[k[0xa]] ^ Box8[k[0xb]] ^ Box8[k[0x7]]
+	r = k.xor(0x0, r, 0x0, S5[k[0xd]], S6[k[0xf]], S7[k[0xc]], S8[k[0xe]], S7[k[0x8]])
+	r = k.xor(0x8, r, 0x4, S5[r[0x0]], S6[r[0x2]], S7[r[0x1]], S8[r[0x3]], S8[k[0xa]])
+	r = k.xor(0xc, r, 0x8, S5[r[0x7]], S6[r[0x6]], S7[r[0x5]], S8[r[0x4]], S5[k[0x9]])
+	r = k.xor(0x4, r, 0xc, S5[r[0xa]], S6[r[0x9]], S7[r[0xb]], S8[r[0x8]], S6[k[0xb]])
+	box[0] = S5[r[0x8]] ^ S6[r[0x9]] ^ S7[r[0x7]] ^ S8[r[0x6]] ^ S5[r[0x2]]
+	box[1] = S5[r[0xa]] ^ S6[r[0xb]] ^ S7[r[0x5]] ^ S8[r[0x4]] ^ S6[r[0x6]]
+	box[2] = S5[r[0xc]] ^ S6[r[0xd]] ^ S7[r[0x3]] ^ S8[r[0x2]] ^ S7[r[0x9]]
+	box[3] = S5[r[0xe]] ^ S6[r[0xf]] ^ S7[r[0x1]] ^ S8[r[0x0]] ^ S8[r[0xc]]
 
-	r = k.foo(0x0, r, 0x0, Box5[k[0xd]], Box6[k[0xf]], Box7[k[0xc]], Box8[k[0xe]], Box7[k[0x8]])
-	r = k.foo(0x8, r, 0x4, Box5[r[0x0]], Box6[r[0x2]], Box7[r[0x1]], Box8[r[0x3]], Box8[k[0xa]])
-	r = k.foo(0xc, r, 0x8, Box5[r[0x7]], Box6[r[0x6]], Box7[r[0x5]], Box8[r[0x4]], Box5[k[0x9]])
-	r = k.foo(0x4, r, 0xc, Box5[r[0xa]], Box6[r[0x9]], Box7[r[0xb]], Box8[r[0x8]], Box6[k[0xb]])
-	box[0x8] = Box5[r[0x3]] ^ Box6[r[0x2]] ^ Box7[r[0xc]] ^ Box8[r[0xd]] ^ Box5[r[0x9]]
-	box[0x9] = Box5[r[0x1]] ^ Box6[r[0x0]] ^ Box7[r[0xe]] ^ Box8[r[0xf]] ^ Box6[r[0xC]]
-	box[0xa] = Box5[r[0x7]] ^ Box6[r[0x6]] ^ Box7[r[0x8]] ^ Box8[r[0x9]] ^ Box7[r[0x2]]
-	box[0xb] = Box5[r[0x5]] ^ Box6[r[0x4]] ^ Box7[r[0xa]] ^ Box8[r[0xb]] ^ Box8[r[0x6]]
+	k = r.xor(0x8, k, 0x0, S5[r[0x5]], S6[r[0x7]], S7[r[0x4]], S8[r[0x6]], S7[r[0x0]])
+	k = r.xor(0x0, k, 0x4, S5[k[0x0]], S6[k[0x2]], S7[k[0x1]], S8[k[0x3]], S8[r[0x2]])
+	k = r.xor(0x4, k, 0x8, S5[k[0x7]], S6[k[0x6]], S7[k[0x5]], S8[k[0x4]], S5[r[0x1]])
+	k = r.xor(0xc, k, 0xc, S5[k[0xa]], S6[k[0x9]], S7[k[0xb]], S8[k[0x8]], S6[r[0x3]])
+	box[4] = S5[k[0x3]] ^ S6[k[0x2]] ^ S7[k[0xc]] ^ S8[k[0xd]] ^ S5[k[0x8]]
+	box[5] = S5[k[0x1]] ^ S6[k[0x0]] ^ S7[k[0xe]] ^ S8[k[0xf]] ^ S6[k[0xd]]
+	box[6] = S5[k[0x7]] ^ S6[k[0x6]] ^ S7[k[0x8]] ^ S8[k[0x9]] ^ S7[k[0x3]]
+	box[7] = S5[k[0x5]] ^ S6[k[0x4]] ^ S7[k[0xa]] ^ S8[k[0xb]] ^ S8[k[0x7]]
 
-	k = r.foo(0x8, k, 0x0, Box5[r[0x5]], Box6[r[0x7]], Box7[r[0x4]], Box8[r[0x6]], Box7[r[0x0]])
-	k = r.foo(0x0, k, 0x4, Box5[k[0x0]], Box6[k[0x2]], Box7[k[0x1]], Box8[k[0x3]], Box8[r[0x2]])
-	k = r.foo(0x4, k, 0x8, Box5[k[0x7]], Box6[k[0x6]], Box7[k[0x5]], Box8[k[0x4]], Box5[r[0x1]])
-	k = r.foo(0xc, k, 0xc, Box5[k[0xa]], Box6[k[0x9]], Box7[k[0xb]], Box8[k[0x8]], Box6[r[0x3]])
-	box[0xc] = Box5[k[0x8]] ^ Box6[k[0x9]] ^ Box7[k[0x7]] ^ Box8[k[0x6]] ^ Box5[k[0x3]]
-	box[0xd] = Box5[k[0xa]] ^ Box6[k[0xb]] ^ Box7[k[0x5]] ^ Box8[k[0x4]] ^ Box6[k[0x7]]
-	box[0xe] = Box5[k[0xc]] ^ Box6[k[0xd]] ^ Box7[k[0x3]] ^ Box8[k[0x2]] ^ Box7[k[0x8]]
-	box[0xf] = Box5[k[0xe]] ^ Box6[k[0xf]] ^ Box7[k[0x1]] ^ Box8[k[0x0]] ^ Box8[k[0xd]]
+	r = k.xor(0x0, r, 0x0, S5[k[0xd]], S6[k[0xf]], S7[k[0xc]], S8[k[0xe]], S7[k[0x8]])
+	r = k.xor(0x8, r, 0x4, S5[r[0x0]], S6[r[0x2]], S7[r[0x1]], S8[r[0x3]], S8[k[0xa]])
+	r = k.xor(0xc, r, 0x8, S5[r[0x7]], S6[r[0x6]], S7[r[0x5]], S8[r[0x4]], S5[k[0x9]])
+	r = k.xor(0x4, r, 0xc, S5[r[0xa]], S6[r[0x9]], S7[r[0xb]], S8[r[0x8]], S6[k[0xb]])
+	box[0x8] = S5[r[0x3]] ^ S6[r[0x2]] ^ S7[r[0xc]] ^ S8[r[0xd]] ^ S5[r[0x9]]
+	box[0x9] = S5[r[0x1]] ^ S6[r[0x0]] ^ S7[r[0xe]] ^ S8[r[0xf]] ^ S6[r[0xC]]
+	box[0xa] = S5[r[0x7]] ^ S6[r[0x6]] ^ S7[r[0x8]] ^ S8[r[0x9]] ^ S7[r[0x2]]
+	box[0xb] = S5[r[0x5]] ^ S6[r[0x4]] ^ S7[r[0xa]] ^ S8[r[0xb]] ^ S8[r[0x6]]
+
+	k = r.xor(0x8, k, 0x0, S5[r[0x5]], S6[r[0x7]], S7[r[0x4]], S8[r[0x6]], S7[r[0x0]])
+	k = r.xor(0x0, k, 0x4, S5[k[0x0]], S6[k[0x2]], S7[k[0x1]], S8[k[0x3]], S8[r[0x2]])
+	k = r.xor(0x4, k, 0x8, S5[k[0x7]], S6[k[0x6]], S7[k[0x5]], S8[k[0x4]], S5[r[0x1]])
+	k = r.xor(0xc, k, 0xc, S5[k[0xa]], S6[k[0x9]], S7[k[0xb]], S8[k[0x8]], S6[r[0x3]])
+	box[0xc] = S5[k[0x8]] ^ S6[k[0x9]] ^ S7[k[0x7]] ^ S8[k[0x6]] ^ S5[k[0x3]]
+	box[0xd] = S5[k[0xa]] ^ S6[k[0xb]] ^ S7[k[0x5]] ^ S8[k[0x4]] ^ S6[k[0x7]]
+	box[0xe] = S5[k[0xc]] ^ S6[k[0xd]] ^ S7[k[0x3]] ^ S8[k[0x2]] ^ S7[k[0x8]]
+	box[0xf] = S5[k[0xe]] ^ S6[k[0xf]] ^ S7[k[0x1]] ^ S8[k[0x0]] ^ S8[k[0xd]]
 
 	return box, k
 }
 
-func (k key) foo(keyFirst int, result key, resultFirst int, masks ...uint32) key {
+func (k key) xor(keyFirst int, result key, resultFirst int, masks ...uint32) key {
 	block := k.extractUint32(keyFirst)
 	for _, mask := range masks {
 		block = block ^ mask
@@ -207,7 +221,7 @@ func rotation(number uint32) byte {
 	return byte(number) & rotationMask
 }
 
-var Box1 = [256]uint32{
+var S1 = [256]uint32{
 	0x30fb40d4, 0x9fa0ff0b, 0x6beccd2f, 0x3f258c7a, 0x1e213f2f, 0x9c004dd3, 0x6003e540, 0xcf9fc949,
 	0xbfd4af27, 0x88bbbdb5, 0xe2034090, 0x98d09675, 0x6e63a0e0, 0x15c361d2, 0xc2e7661d, 0x22d4ff8e,
 	0x28683b6f, 0xc07fd059, 0xff2379c8, 0x775f50e2, 0x43c340d3, 0xdf2f8656, 0x887ca41a, 0xa2d2bd2d,
@@ -241,7 +255,7 @@ var Box1 = [256]uint32{
 	0xbd91e046, 0x9a56456e, 0xdc39200c, 0x20c8c571, 0x962bda1c, 0xe1e696ff, 0xb141ab08, 0x7cca89b9,
 	0x1a69e783, 0x02cc4843, 0xa2f7c579, 0x429ef47d, 0x427b169c, 0x5ac9f049, 0xdd8f0f00, 0x5c8165bf,
 }
-var Box2 = [256]uint32{
+var S2 = [256]uint32{
 	0x1f201094, 0xef0ba75b, 0x69e3cf7e, 0x393f4380, 0xfe61cf7a, 0xeec5207a, 0x55889c94, 0x72fc0651,
 	0xada7ef79, 0x4e1d7235, 0xd55a63ce, 0xde0436ba, 0x99c430ef, 0x5f0c0794, 0x18dcdb7d, 0xa1d6eff3,
 	0xa0b52f7b, 0x59e83605, 0xee15b094, 0xe9ffd909, 0xdc440086, 0xef944459, 0xba83ccb3, 0xe0c3cdfb,
@@ -275,7 +289,7 @@ var Box2 = [256]uint32{
 	0x8f5ea2b3, 0xfc184642, 0x0a036b7a, 0x4fb089bd, 0x649da589, 0xa345415e, 0x5c038323, 0x3e5d3bb9,
 	0x43d79572, 0x7e6dd07c, 0x06dfdf1e, 0x6c6cc4ef, 0x7160a539, 0x73bfbe70, 0x83877605, 0x4523ecf1,
 }
-var Box3 = [256]uint32{
+var S3 = [256]uint32{
 	0x8defc240, 0x25fa5d9f, 0xeb903dbf, 0xe810c907, 0x47607fff, 0x369fe44b, 0x8c1fc644, 0xaececa90,
 	0xbeb1f9bf, 0xeefbcaea, 0xe8cf1950, 0x51df07ae, 0x920e8806, 0xf0ad0548, 0xe13c8d83, 0x927010d5,
 	0x11107d9f, 0x07647db9, 0xb2e3e4d4, 0x3d4f285e, 0xb9afa820, 0xfade82e0, 0xa067268b, 0x8272792e,
@@ -309,7 +323,7 @@ var Box3 = [256]uint32{
 	0x282f9350, 0x8334b362, 0xd91d1120, 0x2b6d8da0, 0x642b1e31, 0x9c305a00, 0x52bce688, 0x1b03588a,
 	0xf7baefd5, 0x4142ed9c, 0xa4315c11, 0x83323ec5, 0xdfef4636, 0xa133c501, 0xe9d3531c, 0xee353783,
 }
-var Box4 = [256]uint32{
+var S4 = [256]uint32{
 	0x9db30420, 0x1fb6e9de, 0xa7be7bef, 0xd273a298, 0x4a4f7bdb, 0x64ad8c57, 0x85510443, 0xfa020ed1,
 	0x7e287aff, 0xe60fb663, 0x095f35a1, 0x79ebf120, 0xfd059d43, 0x6497b7b1, 0xf3641f63, 0x241e4adf,
 	0x28147f5f, 0x4fa2b8cd, 0xc9430040, 0x0cc32220, 0xfdd30b30, 0xc0a5374f, 0x1d2d00d9, 0x24147b15,
@@ -343,7 +357,7 @@ var Box4 = [256]uint32{
 	0x8644213e, 0xb7dc59d0, 0x7965291f, 0xccd6fd43, 0x41823979, 0x932bcdf6, 0xb657c34d, 0x4edfd282,
 	0x7ae5290c, 0x3cb9536b, 0x851e20fe, 0x9833557e, 0x13ecf0b0, 0xd3ffb372, 0x3f85c5c1, 0x0aef7ed2,
 }
-var Box5 = [256]uint32{
+var S5 = [256]uint32{
 	0x7ec90c04, 0x2c6e74b9, 0x9b0e66df, 0xa6337911, 0xb86a7fff, 0x1dd358f5, 0x44dd9d44, 0x1731167f,
 	0x08fbf1fa, 0xe7f511cc, 0xd2051b00, 0x735aba00, 0x2ab722d8, 0x386381cb, 0xacf6243a, 0x69befd7a,
 	0xe6a2e77f, 0xf0c720cd, 0xc4494816, 0xccf5c180, 0x38851640, 0x15b0a848, 0xe68b18cb, 0x4caadeff,
@@ -377,7 +391,7 @@ var Box5 = [256]uint32{
 	0xd6cd2595, 0x68ff1ebf, 0x7555442c, 0xf19f06be, 0xf9e0659a, 0xeeb9491d, 0x34010718, 0xbb30cab8,
 	0xe822fe15, 0x88570983, 0x750e6249, 0xda627e55, 0x5e76ffa8, 0xb1534546, 0x6d47de08, 0xefe9e7d4,
 }
-var Box6 = [256]uint32{
+var S6 = [256]uint32{
 	0xf6fa8f9d, 0x2cac6ce1, 0x4ca34867, 0xe2337f7c, 0x95db08e7, 0x016843b4, 0xeced5cbc, 0x325553ac,
 	0xbf9f0960, 0xdfa1e2ed, 0x83f0579d, 0x63ed86b9, 0x1ab6a6b8, 0xde5ebe39, 0xf38ff732, 0x8989b138,
 	0x33f14961, 0xc01937bd, 0xf506c6da, 0xe4625e7e, 0xa308ea99, 0x4e23e33c, 0x79cbd7cc, 0x48a14367,
@@ -411,7 +425,7 @@ var Box6 = [256]uint32{
 	0x3b4cbf9f, 0x4a5de3ab, 0xe6051d35, 0xa0e1d855, 0xd36b4cf1, 0xf544edeb, 0xb0e93524, 0xbebb8fbd,
 	0xa2d762cf, 0x49c92f54, 0x38b5f331, 0x7128a454, 0x48392905, 0xa65b1db8, 0x851c97bd, 0xd675cf2f,
 }
-var Box7 = [256]uint32{
+var S7 = [256]uint32{
 	0x85e04019, 0x332bf567, 0x662dbfff, 0xcfc65693, 0x2a8d7f6f, 0xab9bc912, 0xde6008a1, 0x2028da1f,
 	0x0227bce7, 0x4d642916, 0x18fac300, 0x50f18b82, 0x2cb2cb11, 0xb232e75c, 0x4b3695f2, 0xb28707de,
 	0xa05fbcf6, 0xcd4181e9, 0xe150210c, 0xe24ef1bd, 0xb168c381, 0xfde4e789, 0x5c79b0d8, 0x1e8bfd43,
@@ -445,7 +459,7 @@ var Box7 = [256]uint32{
 	0x91da55f4, 0x40a230f3, 0xd1988f35, 0xb6e318d2, 0x3ffa50bc, 0x3d40f021, 0xc3c0bdae, 0x4958c24c,
 	0x518f36b2, 0x84b1d370, 0x0fedce83, 0x878ddada, 0xf2a279c7, 0x94e01be8, 0x90716f4b, 0x954b8aa3,
 }
-var Box8 = [256]uint32{
+var S8 = [256]uint32{
 	0xe216300d, 0xbbddfffc, 0xa7ebdabd, 0x35648095, 0x7789f8b7, 0xe6c1121b, 0x0e241600, 0x052ce8b5,
 	0x11a9cfb0, 0xe5952f11, 0xece7990a, 0x9386d174, 0x2a42931c, 0x76e38111, 0xb12def3a, 0x37ddddfc,
 	0xde9adeb1, 0x0a0cc32c, 0xbe197029, 0x84a00940, 0xbb243a0f, 0xb4d137cf, 0xb44e79f0, 0x049eedfd,
