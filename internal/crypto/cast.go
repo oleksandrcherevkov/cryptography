@@ -162,7 +162,7 @@ func (k key) unbox() ([16]uint32, key) {
 	box[0xe] = Box5[k[0xc]] ^ Box6[k[0xd]] ^ Box7[k[0x3]] ^ Box8[k[0x2]] ^ Box7[k[0x8]]
 	box[0xf] = Box5[k[0xe]] ^ Box6[k[0xf]] ^ Box7[k[0x1]] ^ Box8[k[0x0]] ^ Box8[k[0xd]]
 
-	return box, r
+	return box, k
 }
 
 func (k key) foo(keyFirst int, result key, resultFirst int, masks ...uint32) key {
@@ -178,14 +178,14 @@ func (k key) foo(keyFirst int, result key, resultFirst int, masks ...uint32) key
 
 func (k key) extractUint32(position int) uint32 {
 	var result uint32
-	for i := 0; i < 3; i++ {
-		result = result | (uint32(k[position+i]) << (3 - i))
+	for i := 0; i < 4; i++ {
+		result = result | (uint32(k[position+i]) << ((3 - i) * 8))
 	}
 	return result
 }
 
 func extractByte(number uint32, position int) byte {
-	number = number >> (3 - position)
+	number = number >> ((3 - position) * 8)
 	return byte(number)
 }
 
